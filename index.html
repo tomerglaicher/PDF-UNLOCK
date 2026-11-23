@@ -33,12 +33,15 @@ button{font:inherit;border:0;border-radius:8px;padding:11px 18px;cursor:pointer}
 #dl{display:none;margin-top:10px;text-align:center}
 #dl a{display:inline-block;background:var(--ok);color:#fff;text-decoration:none;padding:11px 20px;border-radius:8px;font-weight:600}
 #list{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
-#list li{display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:8px;padding:6px 8px;background:var(--bg)}
+#list li{display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:8px;padding:6px 8px;background:var(--bg)}
 #list .n{color:var(--muted);font-variant-numeric:tabular-nums;min-width:1.4em;text-align:center}
-#list .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#list .nm{flex:1;min-width:0;unicode-bidi:plaintext;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #list button{padding:6px 10px;background:var(--card);color:var(--text);border:1px solid var(--border);line-height:1}
 #list button:disabled{opacity:.35;cursor:default}
 #hint{color:var(--muted);font-size:.85rem;margin-top:8px}
+#list .dt{color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+#sort{margin-top:8px;background:var(--card);color:var(--accent);border:1px solid var(--accent);padding:8px 14px;font-weight:600}
+#sort:disabled{opacity:.5;cursor:default}
 .note{color:var(--muted);font-size:.85rem;margin-top:22px;border-top:1px solid var(--border);padding-top:14px}
 </style>
 </head>
@@ -54,6 +57,7 @@ button{font:inherit;border:0;border-radius:8px;padding:11px 18px;cursor:pointer}
 <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
 <ul id="list"></ul>
 <div id="hint" hidden>הקבצים יאוחדו לפי הסדר הזה. אפשר להזיז עם החצים, להוסיף עוד קבצים או להסיר.</div>
+<button id="sort" type="button" hidden>סדר לפי תאריך (מהישן לחדש)</button>
 
 <label for="pw">סיסמה <small>(צריך רק אם הקבצים דורשים סיסמה כדי להיפתח)</small></label>
 <div class="row">
@@ -205,10 +209,11 @@ function render(){
     const rm=document.createElement('button'); rm.type='button'; rm.textContent='✕'; rm.setAttribute('aria-label','הסר');
     rm.onclick=()=>{ files.splice(i,1); changed(); };
     li.append(n,nm);
+    if(f._date){ const dt=document.createElement('span'); dt.className='dt'; dt.textContent=f._date.toLocaleDateString('he-IL'); dt.title=f._dateSrc; li.append(dt); }
     if(files.length>1) li.append(up,dn);
     li.append(rm); ul.append(li);
   });
-  $('hint').hidden = files.length<2;
+  $('hint').hidden = files.length<2; $('sort').hidden = files.length<2;
   $('go').disabled = files.length===0;
   $('go').textContent = files.length>1 ? 'הסר סיסמה ואחד ל-PDF אחד' : 'הסר סיסמה';
 }
@@ -250,6 +255,44 @@ async function qpdf(inputs, args, outPath){
   if(code===0||code===3){ try{ out=mod.FS.readFile(outPath); }catch(e){} }
   return {out, log:log.join('\n')};
 }
+function pdfDate(bytes){
+  const s=new TextDecoder('latin1').decode(bytes);
+  for(const key of ['CreationDate','ModDate']){
+    const m=s.match(new RegExp('/'+key+'\\s*\\(\\s*(?:D:)?(\\d{4})(\\d{2})?(\\d{2})?(\\d{2})?(\\d{2})?(\\d{2})?'));
+    if(m){ const d=new Date(+m[1],(+(m[2]||1))-1,+(m[3]||1),+(m[4]||0),+(m[5]||0),+(m[6]||0)); if(!isNaN(d)) return d; }
+  }
+  return null;
+}
+// Unlocks one file (cached per password). Returns {out} or {error}.
+async function unlock(f, pw){
+  if(f._cache && f._cache.pw===pw) return f._cache;
+  const bytes=new Uint8Array(await f.arrayBuffer());
+  if(!new TextDecoder('latin1').decode(bytes.slice(0,1024)).includes('%PDF')) return {error:'notpdf'};
+  const r=await qpdf({'/in.pdf':bytes}, ['--decrypt','--object-streams=disable','--password='+pw,'/in.pdf','/out.pdf'], '/out.pdf');
+  if(!r.out){ console.warn(r.log); return {error: /invalid password/i.test(r.log) ? 'password' : 'failed'}; }
+  const d=pdfDate(r.out);
+  f._date = d || new Date(f.lastModified); f._dateSrc = d ? 'תאריך יצירת המסמך' : 'תאריך הקובץ במכשיר';
+  return f._cache={pw, out:r.out, encrypted:isEncrypted(bytes)};
+}
+function unlockError(f, err, pw, many){
+  const who = many ? `בקובץ "${f.name}": ` : '';
+  if(err==='notpdf') return `"${f.name}" לא נראה כמו קובץ PDF.`;
+  if(err==='password') return who + (pw ? 'הסיסמה שגויה. נסו שוב.' : 'הקובץ דורש סיסמה. הקלידו אותה ולחצו שוב.');
+  return who + 'לא הצלחתי לעבד את הקובץ. ייתכן שהוא פגום או מוגן בשיטה לא נתמכת.';
+}
+$('sort').onclick = async ()=>{
+  const pw=$('pw').value; $('sort').disabled=true; $('go').disabled=true;
+  try{
+    for(let i=0;i<files.length;i++){
+      setStatus(`קורא תאריכים, קובץ ${i+1} מתוך ${files.length}...`);
+      const r=await unlock(files[i], pw);
+      if(r.error){ setStatus(unlockError(files[i], r.error, pw, true),'err'); if(r.error==='password') $('pw').focus(); return; }
+    }
+    files.sort((a,b)=>a._date-b._date); changed();
+    setStatus('הקבצים סודרו לפי תאריך.','ok');
+  }catch(e){ console.error(e); setStatus('אירעה שגיאה: '+(e.message||e),'err'); }
+  finally{ $('sort').disabled=false; $('go').disabled=files.length===0; }
+};
 const isEncrypted = b => /\/Encrypt\b/.test(new TextDecoder('latin1').decode(b));
 
 $('go').onclick = async ()=>{
@@ -261,22 +304,9 @@ $('go').onclick = async ()=>{
     for(let i=0;i<files.length;i++){
       const f=files[i];
       setStatus(many ? `פותח קובץ ${i+1} מתוך ${files.length}...` : 'מעבד את הקובץ...');
-      const bytes=new Uint8Array(await f.arrayBuffer());
-      if(!new TextDecoder('latin1').decode(bytes.slice(0,1024)).includes('%PDF')){
-        setStatus(`"${f.name}" לא נראה כמו קובץ PDF.`,'err'); return; }
-      if(isEncrypted(bytes)) anyEnc=true;
-      const r=await qpdf({'/in.pdf':bytes}, ['--decrypt','--password='+pw,'/in.pdf','/out.pdf'], '/out.pdf');
-      if(!r.out){
-        const who = many ? `בקובץ "${f.name}": ` : '';
-        if(/invalid password/i.test(r.log)){
-          setStatus(who + (pw ? 'הסיסמה שגויה. נסו שוב.' : 'הקובץ דורש סיסמה כדי להיפתח. הקלידו אותה ולחצו שוב.'),'err');
-          $('pw').focus();
-        } else {
-          setStatus(who + 'לא הצלחתי לעבד את הקובץ. ייתכן שהוא פגום או מוגן בשיטה לא נתמכת.','err');
-          console.warn(r.log);
-        }
-        return;
-      }
+      const r=await unlock(f, pw);
+      if(r.error){ setStatus(unlockError(f, r.error, pw, many),'err'); if(r.error==='password') $('pw').focus(); return; }
+      if(r.encrypted) anyEnc=true;
       unlocked.push(r.out);
     }
     let result=unlocked[0], name=files[0].name.replace(/\.pdf$/i,'')+' - ללא סיסמה.pdf';
